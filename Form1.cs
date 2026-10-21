@@ -2,6 +2,9 @@ using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 using System.Drawing.Drawing2D;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 
 namespace NaveBrowser;
@@ -43,8 +46,15 @@ public partial class Form1 : Form
     private readonly List<BrowserTab> _tabs = [];
     private readonly List<FavoriteItem> _bookmarks = [];
     private readonly Stack<TabSnapshot> _closedTabs = new();
+    private readonly HashSet<string> _allowedSites = new(StringComparer.OrdinalIgnoreCase);
     private CoreWebView2Environment? _environment;
     private BrowserTab? _activeTab;
+    private Button? _blockerButton;
+    private ToolStripMenuItem? _blockerMenuEnabled;
+    private ToolStripMenuItem? _blockerMenuSiteException;
+    private ToolStripMenuItem? _blockerMenuStatus;
+    private HashSet<string> _blockedHosts = new(BuiltInBlockedHosts, StringComparer.OrdinalIgnoreCase);
+    private DateTimeOffset? _blocklistUpdatedAt;
     private bool _sidebarPinned;
     private bool _toolbarPinned;
     private bool _blockerEnabled = true;
@@ -66,7 +76,7 @@ public partial class Form1 : Form
     private const int ToolbarTopInset = 0;
     private const int EdgeSize = 6;
 
-    private static readonly HashSet<string> BlockedHosts = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> BuiltInBlockedHosts = new(StringComparer.OrdinalIgnoreCase)
     {
         "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com",
         "adnxs.com", "criteo.com", "criteo.net", "taboola.com", "outbrain.com", "adsrvr.org",
@@ -74,6 +84,11 @@ public partial class Form1 : Form
         "openx.net", "scorecardresearch.com", "zedo.com", "moatads.com", "serving-sys.com",
         "casalemedia.com", "smartadserver.com", "sharethrough.com", "contextweb.com"
     };
+    private static readonly Uri HostsListUri = new("https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts");
+    private static readonly HttpClient BlocklistHttpClient = new() { Timeout = TimeSpan.FromSeconds(20) };
+    private static readonly TimeSpan BlocklistRefreshInterval = TimeSpan.FromDays(7);
+    private const int MaxBlocklistBytes = 12 * 1024 * 1024;
+    private const int MaxBlocklistDomains = 250_000;
 
     public Form1()
     {
@@ -87,12 +102,14 @@ public partial class Form1 : Form
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(760, 520);
         KeyPreview = true;
+        LoadBlockerState();
         BuildBrowserShell();
 
         Shown += async (_, _) =>
         {
             _edgeTimer.Start();
             await NewTabAsync();
+            _ = RefreshBlocklistAsync(force: false);
         };
         FormClosing += (_, _) =>
         {
@@ -663,6 +680,10 @@ public partial class Form1 : Form
         blocker.Name = "blockerButton";
         blocker.Height = 26;
         blocker.Margin = new Padding(3, 2, 3, 0);
+        blocker.AccessibleDescription = "Clique para ligar ou pausar. Clique com o botão direito para opções.";
+        _toolTips.SetToolTip(blocker, "Clique para ligar/pausar · botão direito para opções");
+        _blockerButton = blocker;
+        BuildBlockerMenu(blocker);
         var settings = MakeSidebarButton("⚙   Configurações", (_, _) => ShowSettings());
         settings.Height = 26;
         settings.Margin = new Padding(3, 0, 3, 0);
@@ -677,6 +698,70 @@ public partial class Form1 : Form
         _sidebar.Controls.Add(_sidebarLayout);
         Controls.Add(_sidebar);
         _sidebar.BringToFront();
+    }
+
+    private void BuildBlockerMenu(Button blockerButton)
+    {
+        var menu = new ContextMenuStrip();
+        _blockerMenuEnabled = new ToolStripMenuItem("Bloqueador geral") { CheckOnClick = true };
+        _blockerMenuEnabled.Click += (_, _) =>
+        {
+            _blockerEnabled = _blockerMenuEnabled.Checked;
+            UpdateBlockerStatus();
+        };
+
+        _blockerMenuSiteException = new ToolStripMenuItem("Liberar neste site") { CheckOnClick = true };
+        _blockerMenuSiteException.Click += (_, _) => ToggleCurrentSiteException(_blockerMenuSiteException.Checked);
+
+        var updateItem = new ToolStripMenuItem("Atualizar lista agora");
+        updateItem.Click += async (_, _) => await RefreshBlocklistAsync(force: true);
+
+        _blockerMenuStatus = new ToolStripMenuItem { Enabled = false };
+        menu.Items.Add(_blockerMenuEnabled);
+        menu.Items.Add(_blockerMenuSiteException);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(updateItem);
+        menu.Items.Add(_blockerMenuStatus);
+        menu.Opening += (_, _) => RefreshBlockerMenu();
+        blockerButton.ContextMenuStrip = menu;
+    }
+
+    private void RefreshBlockerMenu()
+    {
+        if (_blockerMenuEnabled is not null) _blockerMenuEnabled.Checked = _blockerEnabled;
+        if (_blockerMenuSiteException is not null)
+        {
+            string? site = CurrentSiteHost();
+            _blockerMenuSiteException.Enabled = site is not null;
+            _blockerMenuSiteException.Checked = site is not null && _allowedSites.Contains(site);
+            _blockerMenuSiteException.Text = site is null ? "Liberar neste site (abra uma página)" : $"Liberar neste site ({site})";
+        }
+        if (_blockerMenuStatus is not null)
+        {
+            string updated = _blocklistUpdatedAt is null ? "lista padrão" : $"atualizada {_blocklistUpdatedAt.Value.ToLocalTime():dd/MM/yyyy}";
+            _blockerMenuStatus.Text = $"{_blockedHosts.Count:N0} domínios · {updated}";
+        }
+    }
+
+    private string? CurrentSiteHost() =>
+        _activeTab is not null && TryGetWebUri(_activeTab.Url, out var uri) ? uri.IdnHost.TrimEnd('.') : null;
+
+    private void ToggleCurrentSiteException(bool allow)
+    {
+        string? site = CurrentSiteHost();
+        if (site is null) return;
+        if (allow) _allowedSites.Add(site);
+        else _allowedSites.Remove(site);
+        SaveAllowedSites();
+        UpdateBlockerStatus();
+    }
+
+    private void UpdateBlockerStatus()
+    {
+        if (_blockerButton is not null)
+            _blockerButton.Text = _blockerEnabled ? "◉   Bloqueador ligado" : "◯   Bloqueador pausado";
+        if (_activeTab is not null)
+            _stateLabel.Text = _blockerEnabled ? $"Bloqueador ligado · {_blockedRequests}" : "Bloqueador pausado";
     }
 
     private Button MakeToolButton(string text, string accessibleName, EventHandler click)
@@ -870,6 +955,146 @@ public partial class Form1 : Form
 
     private string UserDataFolder => Environment.GetEnvironmentVariable("NAVE_USER_DATA_DIR") ??
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Nave", "BrowserData");
+
+    private string BlocklistFilePath => Path.Combine(UserDataFolder, "hosts-blocklist.txt");
+    private string AllowedSitesFilePath => Path.Combine(UserDataFolder, "blocker-allowed-sites.json");
+
+    private void LoadBlockerState()
+    {
+        try
+        {
+            if (File.Exists(AllowedSitesFilePath))
+            {
+                var savedSites = JsonSerializer.Deserialize<List<string>>(File.ReadAllText(AllowedSitesFilePath));
+                if (savedSites is not null)
+                    foreach (string site in savedSites)
+                        if (IsValidDomain(site)) _allowedSites.Add(site);
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Could not load blocker exceptions: {ex}");
+        }
+
+        try
+        {
+            if (!File.Exists(BlocklistFilePath)) return;
+            string contents = File.ReadAllText(BlocklistFilePath);
+            HashSet<string> downloadedHosts = ParseHostsList(contents);
+            if (downloadedHosts.Count < 1_000) return;
+
+            _blockedHosts = new HashSet<string>(BuiltInBlockedHosts, StringComparer.OrdinalIgnoreCase);
+            _blockedHosts.UnionWith(downloadedHosts);
+            _blocklistUpdatedAt = File.GetLastWriteTimeUtc(BlocklistFilePath);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Could not load cached blocklist: {ex}");
+        }
+    }
+
+    private void SaveAllowedSites()
+    {
+        try
+        {
+            Directory.CreateDirectory(UserDataFolder);
+            string tempPath = AllowedSitesFilePath + ".tmp";
+            File.WriteAllText(tempPath, JsonSerializer.Serialize(_allowedSites.OrderBy(site => site)), new UTF8Encoding(false));
+            File.Move(tempPath, AllowedSitesFilePath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Could not save blocker exceptions: {ex}");
+            _stateLabel.Text = "Não consegui salvar a exceção deste site";
+        }
+    }
+
+    private async Task RefreshBlocklistAsync(bool force)
+    {
+        try
+        {
+            if (!force && _blocklistUpdatedAt is not null && DateTimeOffset.UtcNow - _blocklistUpdatedAt < BlocklistRefreshInterval)
+                return;
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, HostsListUri);
+            request.Headers.UserAgent.ParseAdd("NaveBrowser/0.1");
+            using HttpResponseMessage response = await BlocklistHttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
+            if (response.Content.Headers.ContentLength is long contentLength && contentLength > MaxBlocklistBytes)
+                throw new InvalidDataException("The blocklist is larger than the allowed size.");
+
+            await using Stream source = await response.Content.ReadAsStreamAsync();
+            using var buffer = new MemoryStream();
+            byte[] chunk = new byte[81_920];
+            int total = 0;
+            while (true)
+            {
+                int read = await source.ReadAsync(chunk);
+                if (read == 0) break;
+                total += read;
+                if (total > MaxBlocklistBytes) throw new InvalidDataException("The blocklist is larger than the allowed size.");
+                await buffer.WriteAsync(chunk.AsMemory(0, read));
+            }
+
+            string contents = Encoding.UTF8.GetString(buffer.ToArray());
+            HashSet<string> downloadedHosts = ParseHostsList(contents);
+            if (downloadedHosts.Count < 1_000 || downloadedHosts.Count > MaxBlocklistDomains)
+                throw new InvalidDataException("The downloaded blocklist did not pass validation.");
+
+            Directory.CreateDirectory(UserDataFolder);
+            string tempPath = BlocklistFilePath + ".tmp";
+            await File.WriteAllTextAsync(tempPath, contents, new UTF8Encoding(false));
+            File.Move(tempPath, BlocklistFilePath, overwrite: true);
+
+            var refreshedHosts = new HashSet<string>(BuiltInBlockedHosts, StringComparer.OrdinalIgnoreCase);
+            refreshedHosts.UnionWith(downloadedHosts);
+            _blockedHosts = refreshedHosts;
+            _blocklistUpdatedAt = DateTimeOffset.UtcNow;
+            RefreshBlockerMenu();
+            if (force) _stateLabel.Text = $"Lista atualizada · {_blockedHosts.Count:N0} domínios";
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Could not refresh blocker list: {ex}");
+            if (force) _stateLabel.Text = "Falha ao atualizar a lista; mantendo a lista salva";
+        }
+        finally
+        {
+            try
+            {
+                string tempPath = BlocklistFilePath + ".tmp";
+                if (File.Exists(tempPath)) File.Delete(tempPath);
+            }
+            catch (Exception ex) { Debug.WriteLine(ex); }
+        }
+    }
+
+    private static HashSet<string> ParseHostsList(string contents)
+    {
+        var hosts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string rawLine in contents.Split('\n'))
+        {
+            string line = rawLine;
+            int commentStart = line.IndexOf('#');
+            if (commentStart >= 0) line = line[..commentStart];
+            string[] fields = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            if (fields.Length < 2 || !IPAddress.TryParse(fields[0], out _)) continue;
+
+            foreach (string candidate in fields.Skip(1))
+            {
+                string host = candidate.Trim().TrimEnd('.').ToLowerInvariant();
+                if (!IsValidDomain(host)) continue;
+                hosts.Add(host);
+                if (hosts.Count > MaxBlocklistDomains)
+                    throw new InvalidDataException("The blocklist contains too many domains.");
+            }
+        }
+        return hosts;
+    }
+
+    private static bool IsValidDomain(string host) =>
+        !string.IsNullOrWhiteSpace(host) && host.Length <= 253 && host.Contains('.') &&
+        Uri.CheckHostName(host) == UriHostNameType.Dns && !IPAddress.TryParse(host, out _);
 
     private void SaveBookmarks()
     {
@@ -1348,7 +1573,7 @@ public partial class Form1 : Form
         core.Settings.AreDefaultContextMenusEnabled = true;
         core.Settings.IsZoomControlEnabled = true;
         core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
-        core.WebResourceRequested += (_, e) => FilterRequest(core, e);
+        core.WebResourceRequested += (_, e) => FilterRequest(tab, core, e);
         core.NavigationStarting += (_, e) =>
         {
             if (Uri.TryCreate(e.Uri, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https")
@@ -1439,15 +1664,39 @@ public partial class Form1 : Form
         previous?.Dispose();
     }
 
-    private void FilterRequest(CoreWebView2 core, CoreWebView2WebResourceRequestedEventArgs e)
+    private void FilterRequest(BrowserTab tab, CoreWebView2 core, CoreWebView2WebResourceRequestedEventArgs e)
     {
         if (!_blockerEnabled || !Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var uri)) return;
-        bool blocked = BlockedHosts.Any(host => uri.Host.Equals(host, StringComparison.OrdinalIgnoreCase) || uri.Host.EndsWith("." + host, StringComparison.OrdinalIgnoreCase));
-        if (!blocked) return;
+        string requestHost = uri.IdnHost.TrimEnd('.');
+        if (CurrentTabIsAllowed(tab) || !IsHostBlocked(requestHost)) return;
         e.Response = core.Environment.CreateWebResourceResponse(new MemoryStream(Array.Empty<byte>()), 403, "Blocked", "Content-Type: text/plain");
         _blockedRequests++;
         if (_activeTab is not null) _stateLabel.Text = $"Bloqueador ligado · {_blockedRequests}";
     }
+
+    private bool CurrentTabIsAllowed(BrowserTab tab)
+    {
+        if (!TryGetWebUri(tab.Url, out var pageUri)) return false;
+        string pageHost = pageUri.IdnHost.TrimEnd('.');
+        return _allowedSites.Any(allowedSite => HostMatchesDomain(pageHost, allowedSite));
+    }
+
+    private bool IsHostBlocked(string host)
+    {
+        if (!IsValidDomain(host)) return false;
+        string candidate = host;
+        while (true)
+        {
+            if (_blockedHosts.Contains(candidate)) return true;
+            int dot = candidate.IndexOf('.');
+            if (dot < 0 || dot == candidate.Length - 1) return false;
+            candidate = candidate[(dot + 1)..];
+        }
+    }
+
+    private static bool HostMatchesDomain(string host, string domain) =>
+        host.Equals(domain, StringComparison.OrdinalIgnoreCase) ||
+        host.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase);
 
     private void HandleHomeMessage(BrowserTab sourceTab, string json)
     {
@@ -1572,9 +1821,7 @@ public partial class Form1 : Form
     private void ToggleBlocker()
     {
         _blockerEnabled = !_blockerEnabled;
-        _stateLabel.Text = _blockerEnabled ? $"Bloqueador ligado · {_blockedRequests}" : "Bloqueador pausado";
-        var button = _sidebar.Controls.Find("blockerButton", true).OfType<Button>().FirstOrDefault();
-        if (button is not null) button.Text = _blockerEnabled ? "◉   Bloqueador ligado" : "◯   Bloqueador pausado";
+        UpdateBlockerStatus();
     }
 
     private void ShowSettings()
@@ -1582,6 +1829,7 @@ public partial class Form1 : Form
         MessageBox.Show(this,
             "Navegação usa o Microsoft Edge WebView2.\n\n" +
             "A barra e as abas aparecem ao passar o mouse pelas bordas superior e esquerda.\n" +
+            "Clique com o botão direito em ‘Bloqueador’ para liberar um site ou atualizar a lista.\n" +
             "Atalhos: Ctrl+T nova aba, Ctrl+L/Ctrl+K pesquisar, Ctrl+Tab trocar abas, " +
             "Ctrl+Shift+T reabrir aba, Ctrl+D favorito, Ctrl+W fechar, Ctrl+R atualizar.",
             "Sobre o Nave", MessageBoxButtons.OK, MessageBoxIcon.Information);
