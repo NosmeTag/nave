@@ -70,7 +70,6 @@ public partial class Form1 : Form
     private int _tabNumber;
     private int _sidebarTarget;
     private int _toolbarTarget;
-    private string? _pendingHomeSearch;
 
     private const int SidebarWidth = 224;
     private const int SidebarInsetTop = 56;
@@ -351,12 +350,6 @@ public partial class Form1 : Form
     {
         string query = _homeSearch.Text.Trim();
         if (string.IsNullOrWhiteSpace(query)) return;
-        if (_activeTab?.View?.CoreWebView2 is null)
-        {
-            _pendingHomeSearch = query;
-            _stateLabel.Text = "Preparando a pesquisa…";
-            return;
-        }
         _homeSearch.Clear();
         if (TryGetWebUri(query, out var uri)) NavigateTo(uri.ToString());
         else if (query.Contains(' ') || !query.Contains('.')) NavigateSearch(query);
@@ -1525,25 +1518,14 @@ public partial class Form1 : Form
         {
             RefreshHomeShortcuts();
             _homePanel.BringToFront();
+            if (tab.View is not null) tab.View.Visible = false;
+            if (_toolbar.Visible) _toolbar.BringToFront();
+            if (_sidebar.Visible) _sidebar.BringToFront();
+            return;
         }
         await EnsureTabViewAsync(tab);
         if (tab.View is null) return;
         try { tab.View.CoreWebView2?.Resume(); } catch { }
-        if (_activeTab == tab && !string.IsNullOrWhiteSpace(_pendingHomeSearch))
-        {
-            _homeSearch.Text = _pendingHomeSearch;
-            _pendingHomeSearch = null;
-            SubmitHomeSearch();
-            return;
-        }
-        if (tab.IsHome)
-        {
-            tab.View.Visible = false;
-            _homePanel.Visible = true;
-            _homePanel.BringToFront();
-            BeginInvoke(() => _homeSearch.Focus());
-            return;
-        }
         _homePanel.Visible = false;
         tab.View.Visible = true;
         tab.View.BringToFront();
@@ -1583,7 +1565,8 @@ public partial class Form1 : Form
             else if (TryGetWebUri(tab.Url, out var uri))
             {
                 tab.IsHome = false;
-                tab.View.Source = uri;
+                if (!string.Equals(tab.View.CoreWebView2?.Source, uri.ToString(), StringComparison.OrdinalIgnoreCase))
+                    tab.View.Source = uri;
             }
             else
             {
@@ -1965,17 +1948,23 @@ public partial class Form1 : Form
 
     private void NavigateTo(string url)
     {
-        if (_activeTab?.View?.CoreWebView2 is null) return;
+        if (_activeTab is null) return;
         if (!TryGetWebUri(url, out var uri)) return;
-        _activeTab.IsHome = false;
-        _activeTab.Url = uri.ToString();
+        BrowserTab tab = _activeTab;
+        tab.IsHome = false;
+        tab.Url = uri.ToString();
         _homePanel.Visible = false;
-        _activeTab.View.Visible = true;
-        _activeTab.View.BringToFront();
+        _address.Text = tab.Url;
+        if (tab.View?.CoreWebView2 is not { } core)
+        {
+            if (tab.View is null) _ = SelectTabAsync(tab);
+            return;
+        }
+        tab.View.Visible = true;
+        tab.View.BringToFront();
         if (_toolbar.Visible) _toolbar.BringToFront();
         if (_sidebar.Visible) _sidebar.BringToFront();
-        _activeTab.View.CoreWebView2.Navigate(_activeTab.Url);
-        _address.Text = _activeTab.Url;
+        core.Navigate(tab.Url);
     }
 
     private static bool TryGetWebUri(string value, out Uri uri)
@@ -1998,9 +1987,10 @@ public partial class Form1 : Form
             tab.Url = "nave://nova-guia";
             tab.Title = "Nova guia";
             tab.IsHome = true;
+            tab.Configured = false;
             SetSiteIcon(tab, CreateFallbackSiteIcon());
-            tab.View?.CoreWebView2?.Navigate("about:blank");
-            tab.View!.Visible = false;
+            tab.View?.Dispose();
+            tab.View = null;
             _homePanel.Visible = true;
             _homePanel.BringToFront();
             _homeSearch.Clear();
