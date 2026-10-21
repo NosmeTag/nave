@@ -1,0 +1,11 @@
+# Saídas locais do build e das publicações
+bin/
+obj/
+publish/
+publish-*/
+artifacts/
+*.user
+.vs/
+
+# Arquivos locais de contexto, caminhos e processos de desenvolvimento
+HANDOFF.md

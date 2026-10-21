@@ -1,0 +1,36 @@
+name: Build Nave prerelease
+
+on:
+  push:
+    tags:
+      - 'v*-beta.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Publish self-contained app
+        shell: pwsh
+        run: dotnet publish NaveBrowser.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o artifacts/publish
+
+      - name: Package portable build
+        shell: pwsh
+        run: Compress-Archive -Path artifacts/publish/Nave.exe -DestinationPath artifacts/Nave-win-x64.zip
+
+      - name: Publish as prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Nave ${{ github.ref_name }}
+          prerelease: true
+          files: artifacts/Nave-win-x64.zip
