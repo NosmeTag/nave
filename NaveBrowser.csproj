@@ -9,6 +9,7 @@
     <ApplicationTitle>Nave</ApplicationTitle>
     <ApplicationIcon>Assets\MannyCalavera.ico</ApplicationIcon>
     <Version>0.1.0</Version>
+    <InformationalVersion>0.1.0</InformationalVersion>
     <AssemblyName>Nave</AssemblyName>
     <RootNamespace>NaveBrowser</RootNamespace>
     <PlatformTarget>x64</PlatformTarget>

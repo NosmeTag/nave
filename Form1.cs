@@ -2,10 +2,15 @@ using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 using System.Drawing.Drawing2D;
 using System.Diagnostics;
+using System.Globalization;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace NaveBrowser;
 
@@ -59,6 +64,7 @@ public partial class Form1 : Form
     private bool _toolbarPinned;
     private bool _blockerEnabled = true;
     private bool _isShuttingDown;
+    private bool _isCheckingForUpdates;
     private int _blockedRequests;
     private int _tabNumber;
     private int _sidebarTarget;
@@ -66,10 +72,9 @@ public partial class Form1 : Form
     private string? _pendingHomeSearch;
 
     private const int SidebarWidth = 224;
-    private const int SidebarInsetLeft = 12;
     private const int SidebarInsetTop = 56;
     private const int SidebarInsetBottom = 20;
-    private const int SidebarChromeHeight = 194;
+    private const int SidebarChromeHeight = 224;
     private const int SidebarTabRowHeight = 38;
     private const int SidebarMaxHeight = 720;
     private const int ToolbarHeight = 88;
@@ -86,6 +91,8 @@ public partial class Form1 : Form
     };
     private static readonly Uri HostsListUri = new("https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts");
     private static readonly HttpClient BlocklistHttpClient = new() { Timeout = TimeSpan.FromSeconds(20) };
+    private static readonly HttpClient UpdateHttpClient = CreateUpdateHttpClient();
+    private const string GitHubReleasesApi = "https://api.github.com/repos/NosmeTag/Nave/releases?per_page=30";
     private static readonly TimeSpan BlocklistRefreshInterval = TimeSpan.FromDays(7);
     private const int MaxBlocklistBytes = 12 * 1024 * 1024;
     private const int MaxBlocklistDomains = 250_000;
@@ -110,6 +117,7 @@ public partial class Form1 : Form
             _edgeTimer.Start();
             await NewTabAsync();
             _ = RefreshBlocklistAsync(force: false);
+            _ = CheckForUpdatesAsync(automatic: true);
         };
         FormClosing += (_, _) =>
         {
@@ -273,6 +281,29 @@ public partial class Form1 : Form
         path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
         path.CloseFigure();
         return path;
+    }
+
+    private static GraphicsPath CreateDockedSidebarPath(Rectangle bounds, int radius)
+    {
+        var path = new GraphicsPath();
+        if (bounds.Width < 2 || bounds.Height < 2) return path;
+        int arc = Math.Max(2, Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height)));
+        path.StartFigure();
+        path.AddLine(bounds.Left, bounds.Top, bounds.Right - arc, bounds.Top);
+        path.AddArc(bounds.Right - arc, bounds.Top, arc, arc, 270, 90);
+        path.AddLine(bounds.Right, bounds.Top + arc / 2, bounds.Right, bounds.Bottom - arc / 2);
+        path.AddArc(bounds.Right - arc, bounds.Bottom - arc, arc, arc, 0, 90);
+        path.AddLine(bounds.Right - arc / 2, bounds.Bottom, bounds.Left, bounds.Bottom);
+        path.CloseFigure();
+        return path;
+    }
+
+    private static HttpClient CreateUpdateHttpClient()
+    {
+        var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("NaveBrowser/1.0 (+https://github.com/NosmeTag/Nave)");
+        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+        return client;
     }
 
     private static void ApplyRoundedRegion(Control control, int radius)
@@ -557,13 +588,17 @@ public partial class Form1 : Form
     {
         _sidebar.BackColor = SideColor;
         _sidebar.Size = new Size(0, GetSidebarHeight());
-        _sidebar.Location = new Point(SidebarInsetLeft, GetSidebarTop(_sidebar.Height));
+        _sidebar.Location = new Point(0, GetSidebarTop(_sidebar.Height));
         _sidebar.Anchor = AnchorStyles.Top | AnchorStyles.Left;
         _sidebar.Visible = false;
         _sidebar.Resize += (_, _) =>
         {
             if (_sidebar.Width >= 32 && _sidebar.Height >= 32)
-                ApplyRoundedRegion(_sidebar, 16);
+            {
+                using var shape = CreateDockedSidebarPath(new Rectangle(0, 0, _sidebar.Width, _sidebar.Height), 16);
+                _sidebar.Region?.Dispose();
+                _sidebar.Region = new Region(shape);
+            }
             else
             {
                 _sidebar.Region?.Dispose();
@@ -574,7 +609,7 @@ public partial class Form1 : Form
         {
             if (_sidebar.Width < 32 || _sidebar.Height < 32) return;
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using var outline = CreateRoundedPath(new Rectangle(0, 0, _sidebar.Width - 1, _sidebar.Height - 1), 16);
+            using var outline = CreateDockedSidebarPath(new Rectangle(0, 0, _sidebar.Width - 1, _sidebar.Height - 1), 16);
             using var pen = new Pen(LineColor);
             e.Graphics.DrawPath(pen, outline);
         };
@@ -587,7 +622,7 @@ public partial class Form1 : Form
         _sidebarLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
         _sidebarLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         _sidebarLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        _sidebarLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
+        _sidebarLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 90));
 
         var header = new Panel { Dock = DockStyle.Fill, BackColor = SideColor, Padding = new Padding(14, 0, 10, 0) };
         var brand = new Label
@@ -669,25 +704,30 @@ public partial class Form1 : Form
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
             BackColor = SideColor,
-            Padding = new Padding(6, 5, 6, 0)
+            Padding = new Padding(10, 7, 10, 4)
         };
         footer.Paint += (_, e) =>
         {
             using var pen = new Pen(LineColor);
-            e.Graphics.DrawLine(pen, 12, 0, Math.Max(12, footer.Width - 12), 0);
+            e.Graphics.DrawLine(pen, 5, 0, Math.Max(5, footer.Width - 5), 0);
         };
-        var blocker = MakeSidebarButton("◉   Bloqueador ligado", (_, _) => ToggleBlocker());
+        var blocker = MakeSidebarButton("◉    Bloqueador ligado", (_, _) => ToggleBlocker());
         blocker.Name = "blockerButton";
-        blocker.Height = 26;
-        blocker.Margin = new Padding(3, 2, 3, 0);
+        blocker.Height = 30;
+        blocker.Margin = new Padding(0, 2, 0, 2);
         blocker.AccessibleDescription = "Clique para ligar ou pausar. Clique com o botão direito para opções.";
         _toolTips.SetToolTip(blocker, "Clique para ligar/pausar · botão direito para opções");
         _blockerButton = blocker;
         BuildBlockerMenu(blocker);
-        var settings = MakeSidebarButton("⚙   Configurações", (_, _) => ShowSettings());
-        settings.Height = 26;
-        settings.Margin = new Padding(3, 0, 3, 0);
+        var extensions = MakeSidebarButton("▦    Extensões", async (_, _) => await ManageExtensionsAsync());
+        extensions.Height = 30;
+        extensions.Margin = new Padding(0, 1, 0, 1);
+        _toolTips.SetToolTip(extensions, "Instalar, ativar ou remover extensões do navegador");
+        var settings = MakeSidebarButton("⚙    Configurações", (_, _) => ShowSettings());
+        settings.Height = 30;
+        settings.Margin = new Padding(0, 1, 0, 1);
         footer.Controls.Add(blocker);
+        footer.Controls.Add(extensions);
         footer.Controls.Add(settings);
 
         _sidebarLayout.Controls.Add(header, 0, 0);
@@ -958,6 +998,7 @@ public partial class Form1 : Form
 
     private string BlocklistFilePath => Path.Combine(UserDataFolder, "hosts-blocklist.txt");
     private string AllowedSitesFilePath => Path.Combine(UserDataFolder, "blocker-allowed-sites.json");
+    private string UpdateCheckFilePath => Path.Combine(UserDataFolder, "last-update-check.txt");
 
     private void LoadBlockerState()
     {
@@ -1166,7 +1207,7 @@ public partial class Form1 : Form
         _toolbar.Width = ClientSize.Width;
         _toolbar.Top = ToolbarTopInset;
         _sidebar.Height = GetSidebarHeight();
-        _sidebar.Location = new Point(SidebarInsetLeft, GetSidebarTop(_sidebar.Height));
+        _sidebar.Location = new Point(0, GetSidebarTop(_sidebar.Height));
         _favorites.Width = Math.Max(220, ClientSize.Width - 215);
         _stateLabel.Left = ClientSize.Width - _stateLabel.Width - 18;
         LayoutToolbarTop();
@@ -1560,7 +1601,193 @@ public partial class Form1 : Form
     private async Task<CoreWebView2Environment> CreateEnvironmentAsync()
     {
         Directory.CreateDirectory(UserDataFolder);
-        return await CoreWebView2Environment.CreateAsync(userDataFolder: UserDataFolder);
+        var options = new CoreWebView2EnvironmentOptions
+        {
+            AreBrowserExtensionsEnabled = true
+        };
+        return await CoreWebView2Environment.CreateAsync(options: options, userDataFolder: UserDataFolder);
+    }
+
+    private async Task ManageExtensionsAsync(Form? owner = null)
+    {
+        CoreWebView2Profile? profile = _activeTab?.View?.CoreWebView2?.Profile;
+        if (profile is null)
+        {
+            MessageBox.Show(this, "O motor do navegador ainda está iniciando. Tente novamente em alguns segundos.",
+                "Extensões", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dialog = new Form
+        {
+            Text = "Extensões do Nave",
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+            ClientSize = new Size(500, 360),
+            BackColor = WindowColor,
+            ForeColor = TextColor,
+            Font = new Font("Segoe UI", 9F)
+        };
+
+        var description = new Label
+        {
+            Text = "Instale extensões descompactadas. Só adicione extensões de fontes em que confia.",
+            Location = new Point(18, 15),
+            Size = new Size(464, 38),
+            ForeColor = MutedColor
+        };
+        var list = new ListBox
+        {
+            Location = new Point(18, 58),
+            Size = new Size(464, 218),
+            BackColor = FieldColor,
+            ForeColor = TextColor,
+            BorderStyle = BorderStyle.FixedSingle,
+            IntegralHeight = false
+        };
+        var install = MakeDialogButton("Instalar pasta…", 18, 294, 118);
+        var toggle = MakeDialogButton("Ativar / pausar", 144, 294, 122);
+        var remove = MakeDialogButton("Remover", 274, 294, 92);
+        var close = MakeDialogButton("Fechar", 390, 294, 92);
+        close.DialogResult = DialogResult.Cancel;
+        dialog.CancelButton = close;
+        dialog.Controls.AddRange([description, list, install, toggle, remove, close]);
+
+        async Task RefreshExtensionsAsync()
+        {
+            list.Items.Clear();
+            try
+            {
+                foreach (var extension in await profile.GetBrowserExtensionsAsync())
+                    list.Items.Add(new ExtensionListItem(extension));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(dialog, $"Não consegui ler as extensões instaladas.\n\n{ex.Message}",
+                    "Extensões", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        install.Click += async (_, _) =>
+        {
+            using var folderDialog = new FolderBrowserDialog
+            {
+                Description = "Escolha a pasta da extensão. Ela precisa conter manifest.json.",
+                UseDescriptionForTitle = true,
+                ShowNewFolderButton = false
+            };
+            if (folderDialog.ShowDialog(dialog) != DialogResult.OK) return;
+            string manifestPath = Path.Combine(folderDialog.SelectedPath, "manifest.json");
+            if (!File.Exists(manifestPath))
+            {
+                MessageBox.Show(dialog, "Essa pasta não contém manifest.json. Selecione a pasta principal da extensão descompactada.",
+                    "Extensão inválida", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            string extensionDetails;
+            try
+            {
+                using var manifest = JsonDocument.Parse(await File.ReadAllTextAsync(manifestPath));
+                JsonElement root = manifest.RootElement;
+                string name = ReadManifestString(root, "name") ?? Path.GetFileName(folderDialog.SelectedPath);
+                string version = ReadManifestString(root, "version") ?? "desconhecida";
+                string permissions = ReadManifestArray(root, "permissions");
+                string hosts = ReadManifestArray(root, "host_permissions");
+                extensionDetails = $"Extensão: {name}\nVersão: {version}\nPermissões: {permissions}\nSites: {hosts}\n\nExtensões podem ler e modificar páginas conforme essas permissões. Instale apenas se confiar na origem.";
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(dialog, $"Não consegui ler o manifest.json.\n\n{ex.Message}", "Extensão inválida",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (MessageBox.Show(dialog, extensionDetails, "Confirmar instalação", MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning) != DialogResult.OK) return;
+            try
+            {
+                await profile.AddBrowserExtensionAsync(folderDialog.SelectedPath);
+                await RefreshExtensionsAsync();
+                MessageBox.Show(dialog, "Extensão instalada. Talvez seja necessário atualizar as abas abertas.",
+                    "Extensões", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(dialog, $"Não consegui instalar essa extensão. Confira se ela é compatível com WebView2.\n\n{ex.Message}",
+                    "Falha na instalação", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        };
+
+        toggle.Click += async (_, _) =>
+        {
+            if (list.SelectedItem is not ExtensionListItem selected) return;
+            try
+            {
+                await selected.Extension.EnableAsync(!selected.Extension.IsEnabled);
+                await RefreshExtensionsAsync();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(dialog, $"Não consegui alterar essa extensão.\n\n{ex.Message}", "Extensões",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        };
+
+        remove.Click += async (_, _) =>
+        {
+            if (list.SelectedItem is not ExtensionListItem selected) return;
+            if (MessageBox.Show(dialog, $"Remover {selected.Extension.Name}?", "Confirmar remoção",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            try
+            {
+                await selected.Extension.RemoveAsync();
+                await RefreshExtensionsAsync();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(dialog, $"Não consegui remover essa extensão.\n\n{ex.Message}", "Extensões",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        };
+
+        await RefreshExtensionsAsync();
+        dialog.ShowDialog(owner ?? this);
+    }
+
+    private Button MakeDialogButton(string text, int x, int y, int width)
+    {
+        var button = new Button
+        {
+            Text = text,
+            Location = new Point(x, y),
+            Size = new Size(width, 34),
+            FlatStyle = FlatStyle.Flat,
+            BackColor = TabActiveColor,
+            ForeColor = TextColor,
+            Cursor = Cursors.Hand
+        };
+        button.FlatAppearance.BorderColor = LineColor;
+        button.FlatAppearance.MouseOverBackColor = TabHoverColor;
+        return button;
+    }
+
+    private static string? ReadManifestString(JsonElement root, string property) =>
+        root.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static string ReadManifestArray(JsonElement root, string property) =>
+        root.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.Array
+            ? string.Join(", ", value.EnumerateArray().Where(item => item.ValueKind == JsonValueKind.String).Select(item => item.GetString()))
+            : "nenhuma declarada";
+
+    private sealed record ExtensionListItem(CoreWebView2BrowserExtension Extension)
+    {
+        public override string ToString() => $"{Extension.Name}  ·  {(Extension.IsEnabled ? "Ativa" : "Pausada")}";
     }
 
     private void ConfigureWebView(BrowserTab tab)
@@ -1826,13 +2053,359 @@ public partial class Form1 : Form
 
     private void ShowSettings()
     {
-        MessageBox.Show(this,
-            "Navegação usa o Microsoft Edge WebView2.\n\n" +
-            "A barra e as abas aparecem ao passar o mouse pelas bordas superior e esquerda.\n" +
-            "Clique com o botão direito em ‘Bloqueador’ para liberar um site ou atualizar a lista.\n" +
-            "Atalhos: Ctrl+T nova aba, Ctrl+L/Ctrl+K pesquisar, Ctrl+Tab trocar abas, " +
-            "Ctrl+Shift+T reabrir aba, Ctrl+D favorito, Ctrl+W fechar, Ctrl+R atualizar.",
-            "Sobre o Nave", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        using var dialog = new Form
+        {
+            Text = "Configurações do Nave",
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+            ClientSize = new Size(560, 430),
+            BackColor = WindowColor,
+            ForeColor = TextColor,
+            Font = new Font("Segoe UI", 9F)
+        };
+
+        var title = new Label
+        {
+            Text = "Configurações",
+            Location = new Point(24, 18),
+            Size = new Size(400, 34),
+            ForeColor = TextColor,
+            Font = new Font("Segoe UI Semibold", 17F)
+        };
+        var subtitle = new Label
+        {
+            Text = "Atualizações, extensões e atalhos em um só lugar.",
+            Location = new Point(26, 53),
+            Size = new Size(500, 22),
+            ForeColor = MutedColor
+        };
+
+        var updateCard = CreateSettingsCard(22, 90, 516, 94);
+        var updateTitle = new Label
+        {
+            Text = "Atualizações do Nave",
+            Location = new Point(16, 13),
+            Size = new Size(270, 24),
+            ForeColor = TextColor,
+            Font = new Font("Segoe UI Semibold", 10F)
+        };
+        var updateDescription = new Label
+        {
+            Text = $"Versão instalada: {GetCurrentVersionText()} · busca automática diária",
+            Location = new Point(16, 43),
+            Size = new Size(320, 30),
+            ForeColor = MutedColor
+        };
+        var checkButton = MakeDialogButton("Procurar", 392, 29, 104);
+        checkButton.Click += async (_, _) => await CheckForUpdatesAsync(automatic: false);
+        updateCard.Controls.AddRange([updateTitle, updateDescription, checkButton]);
+
+        var extensionCard = CreateSettingsCard(22, 197, 516, 74);
+        var extensionTitle = new Label
+        {
+            Text = "Extensões",
+            Location = new Point(16, 11),
+            Size = new Size(250, 23),
+            ForeColor = TextColor,
+            Font = new Font("Segoe UI Semibold", 10F)
+        };
+        var extensionDescription = new Label
+        {
+            Text = "Instale, pause ou remova extensões do navegador.",
+            Location = new Point(16, 36),
+            Size = new Size(330, 22),
+            ForeColor = MutedColor
+        };
+        var extensionButton = MakeDialogButton("Gerenciar", 392, 20, 104);
+        extensionButton.Click += async (_, _) => await ManageExtensionsAsync(dialog);
+        extensionCard.Controls.AddRange([extensionTitle, extensionDescription, extensionButton]);
+
+        var shortcutsCard = CreateSettingsCard(22, 284, 516, 122);
+        var shortcutsTitle = new Label
+        {
+            Text = "Atalhos",
+            Location = new Point(16, 10),
+            Size = new Size(200, 23),
+            ForeColor = TextColor,
+            Font = new Font("Segoe UI Semibold", 10F)
+        };
+        var shortcuts = new Label
+        {
+            Text = "Ctrl+T  Nova aba        Ctrl+L / Ctrl+K  Pesquisar        Ctrl+W  Fechar aba\n" +
+                   "Ctrl+Tab  Trocar aba     Ctrl+Shift+T  Reabrir aba      Ctrl+D  Favorito\n" +
+                   "Ctrl+R / F5  Atualizar página",
+            Location = new Point(16, 39),
+            Size = new Size(484, 67),
+            ForeColor = MutedColor
+        };
+        shortcutsCard.Controls.AddRange([shortcutsTitle, shortcuts]);
+        dialog.Controls.AddRange([title, subtitle, updateCard, extensionCard, shortcutsCard]);
+        dialog.AcceptButton = checkButton;
+        dialog.ShowDialog(this);
+    }
+
+    private Panel CreateSettingsCard(int x, int y, int width, int height)
+    {
+        var card = new Panel
+        {
+            Location = new Point(x, y),
+            Size = new Size(width, height),
+            BackColor = SideColor
+        };
+        card.Paint += (_, e) =>
+        {
+            using var pen = new Pen(LineColor);
+            using var path = CreateRoundedPath(new Rectangle(0, 0, card.Width - 1, card.Height - 1), 12);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.DrawPath(pen, path);
+        };
+        ApplyRoundedRegion(card, 12);
+        return card;
+    }
+
+    private static string GetCurrentVersionText()
+    {
+        string? informationalVersion = Assembly.GetExecutingAssembly()
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(informationalVersion)) return informationalVersion.Split('+')[0];
+        return Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "desconhecida";
+    }
+
+    private async Task CheckForUpdatesAsync(bool automatic)
+    {
+        if (_isCheckingForUpdates) return;
+        if (automatic && WasCheckedForUpdatesRecently()) return;
+        _isCheckingForUpdates = true;
+        try
+        {
+            if (!automatic) _stateLabel.Text = "Procurando atualizações…";
+            var release = await FindLatestReleaseAsync();
+            if (automatic)
+            {
+                Directory.CreateDirectory(UserDataFolder);
+                await File.WriteAllTextAsync(UpdateCheckFilePath, DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+            }
+            if (release is null || release.Version.CompareTo(ReleaseVersion.FromAssembly()) <= 0)
+            {
+                if (!automatic)
+                    MessageBox.Show(this, release is null
+                            ? "Ainda não há uma versão publicada para atualizar."
+                            : $"Você já está na versão mais recente ({GetCurrentVersionText()}).",
+                        "Atualizações do Nave", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (MessageBox.Show(this,
+                    $"Uma nova versão do Nave está disponível: {release.Tag}.\nVersão atual: {GetCurrentVersionText()}\n\nBaixar e instalar agora? O Nave vai fechar e reabrir ao terminar.",
+                    "Atualização disponível", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes)
+                return;
+
+            await DownloadAndInstallUpdateAsync(release);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Update check failed: {ex}");
+            if (!automatic)
+                MessageBox.Show(this, $"Não consegui verificar ou instalar atualizações.\n\n{ex.Message}",
+                    "Atualizações do Nave", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _isCheckingForUpdates = false;
+        }
+    }
+
+    private bool WasCheckedForUpdatesRecently()
+    {
+        try
+        {
+            return File.Exists(UpdateCheckFilePath) &&
+                   DateTimeOffset.TryParse(File.ReadAllText(UpdateCheckFilePath), CultureInfo.InvariantCulture,
+                       DateTimeStyles.RoundtripKind, out var lastCheck) &&
+                   DateTimeOffset.UtcNow - lastCheck < TimeSpan.FromHours(24);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Could not read update timestamp: {ex}");
+            return false;
+        }
+    }
+
+    private async Task<GitHubRelease?> FindLatestReleaseAsync()
+    {
+        using JsonDocument document = JsonDocument.Parse(await UpdateHttpClient.GetStringAsync(GitHubReleasesApi));
+        GitHubRelease? latest = null;
+        foreach (JsonElement item in document.RootElement.EnumerateArray())
+        {
+            string? tag = item.TryGetProperty("tag_name", out var tagElement) ? tagElement.GetString() : null;
+            if (string.IsNullOrWhiteSpace(tag) || !ReleaseVersion.TryParse(tag, out var version)) continue;
+            if (!item.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array) continue;
+            string? zipUrl = null;
+            string? checksumsUrl = null;
+            foreach (JsonElement asset in assets.EnumerateArray())
+            {
+                string? name = asset.TryGetProperty("name", out var nameElement) ? nameElement.GetString() : null;
+                string? url = asset.TryGetProperty("browser_download_url", out var urlElement) ? urlElement.GetString() : null;
+                if (name == "Nave-win-x64.zip") zipUrl = url;
+                else if (name == "SHA256SUMS.txt") checksumsUrl = url;
+            }
+            if (!Uri.TryCreate(zipUrl, UriKind.Absolute, out var zipUri) || zipUri.Host != "github.com" ||
+                !Uri.TryCreate(checksumsUrl, UriKind.Absolute, out var checksumUri) || checksumUri.Host != "github.com") continue;
+            var release = new GitHubRelease(tag, version, zipUri, checksumUri);
+            if (latest is null || release.Version.CompareTo(latest.Version) > 0) latest = release;
+        }
+        return latest;
+    }
+
+    private async Task DownloadAndInstallUpdateAsync(GitHubRelease release)
+    {
+        _stateLabel.Text = $"Baixando Nave {release.Tag}…";
+        string root = Path.Combine(Path.GetTempPath(), "NaveUpdate-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        string zipPath = Path.Combine(root, "Nave-win-x64.zip");
+        const int maxArchiveBytes = 256 * 1024 * 1024;
+        using (HttpResponseMessage response = await UpdateHttpClient.GetAsync(release.ZipUrl, HttpCompletionOption.ResponseHeadersRead))
+        {
+            response.EnsureSuccessStatusCode();
+            if (response.Content.Headers.ContentLength.HasValue && response.Content.Headers.ContentLength.Value > maxArchiveBytes)
+                throw new InvalidDataException("O arquivo de atualização excede o limite permitido.");
+            await using Stream input = await response.Content.ReadAsStreamAsync();
+            await using var output = new FileStream(zipPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            var buffer = new byte[64 * 1024];
+            long total = 0;
+            int read;
+            while ((read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length))) > 0)
+            {
+                total += read;
+                if (total > maxArchiveBytes)
+                    throw new InvalidDataException("O arquivo de atualização excede o limite permitido.");
+                await output.WriteAsync(buffer.AsMemory(0, read));
+            }
+            if (total == 0) throw new InvalidDataException("O arquivo de atualização está vazio.");
+        }
+
+        string checksums = await UpdateHttpClient.GetStringAsync(release.ChecksumsUrl);
+        Match checksumMatch = Regex.Match(checksums,
+            "(?im)^(?<hash>[a-f0-9]{64})\\s+\\*?Nave-win-x64\\.zip\\s*$");
+        if (!checksumMatch.Success) throw new InvalidDataException("Não encontrei o checksum esperado no pacote de atualização.");
+        await using var archiveFile = File.OpenRead(zipPath);
+        string actualHash = Convert.ToHexString(await SHA256.HashDataAsync(archiveFile));
+        if (!CryptographicOperations.FixedTimeEquals(
+                Convert.FromHexString(actualHash), Convert.FromHexString(checksumMatch.Groups["hash"].Value)))
+            throw new InvalidDataException("A verificação SHA-256 do pacote falhou. A atualização foi cancelada.");
+
+        string stagedExe = Path.Combine(root, "Nave.exe");
+        using (var zip = ZipFile.OpenRead(zipPath))
+        {
+            if (zip.Entries.Count != 1 || !string.Equals(zip.Entries[0].FullName, "Nave.exe", StringComparison.OrdinalIgnoreCase) ||
+                zip.Entries[0].Length == 0 || zip.Entries[0].Length > maxArchiveBytes)
+                throw new InvalidDataException("O ZIP não tem o formato esperado para uma atualização do Nave.");
+            await using Stream input = zip.Entries[0].Open();
+            await using FileStream output = File.Create(stagedExe);
+            await input.CopyToAsync(output);
+        }
+
+        string targetExe = Application.ExecutablePath;
+        string installDirectory = Path.GetDirectoryName(targetExe) ?? AppContext.BaseDirectory;
+        string scriptPath = Path.Combine(root, "install-update.ps1");
+        await File.WriteAllTextAsync(scriptPath, UpdateInstallScript, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            WorkingDirectory = installDirectory
+        };
+        startInfo.ArgumentList.Add("-NoProfile");
+        startInfo.ArgumentList.Add("-NonInteractive");
+        startInfo.ArgumentList.Add("-ExecutionPolicy");
+        startInfo.ArgumentList.Add("Bypass");
+        startInfo.ArgumentList.Add("-File");
+        startInfo.ArgumentList.Add(scriptPath);
+        startInfo.ArgumentList.Add(Environment.ProcessId.ToString());
+        startInfo.ArgumentList.Add(stagedExe);
+        startInfo.ArgumentList.Add(targetExe);
+        startInfo.ArgumentList.Add(installDirectory);
+        startInfo.ArgumentList.Add(root);
+        Process.Start(startInfo) ?? throw new InvalidOperationException("Não consegui iniciar a etapa de instalação.");
+        _isShuttingDown = true;
+        Application.Exit();
+    }
+
+    private const string UpdateInstallScript = """
+        param([int]$ParentId, [string]$StagedExe, [string]$TargetExe, [string]$WorkDirectory, [string]$UpdateDirectory)
+        $ErrorActionPreference = 'Stop'
+        $newPath = "$TargetExe.new"
+        $backupPath = "$TargetExe.previous"
+        try {
+            Wait-Process -Id $ParentId -Timeout 120 -ErrorAction SilentlyContinue
+            if (Get-Process -Id $ParentId -ErrorAction SilentlyContinue) { throw 'O Nave ainda está aberto.' }
+            Copy-Item -LiteralPath $StagedExe -Destination $newPath -Force
+            if (Test-Path -LiteralPath $backupPath) { Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $TargetExe) { Move-Item -LiteralPath $TargetExe -Destination $backupPath -Force }
+            try { Move-Item -LiteralPath $newPath -Destination $TargetExe -Force }
+            catch {
+                if (Test-Path -LiteralPath $backupPath) { Move-Item -LiteralPath $backupPath -Destination $TargetExe -Force }
+                throw
+            }
+            Start-Process -FilePath $TargetExe -WorkingDirectory $WorkDirectory
+            if (Test-Path -LiteralPath $backupPath) { Remove-Item -LiteralPath $backupPath -Force }
+        } catch {
+            if (Test-Path -LiteralPath $backupPath) {
+                if (Test-Path -LiteralPath $TargetExe) { Remove-Item -LiteralPath $TargetExe -Force -ErrorAction SilentlyContinue }
+                Move-Item -LiteralPath $backupPath -Destination $TargetExe -Force -ErrorAction SilentlyContinue
+            }
+            Add-Type -AssemblyName System.Windows.Forms
+            [System.Windows.Forms.MessageBox]::Show("A atualização não foi concluída. O Nave continua na versão anterior.`n`n$($_.Exception.Message)", 'Atualização do Nave', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        }
+        """;
+
+    private sealed record GitHubRelease(string Tag, ReleaseVersion Version, Uri ZipUrl, Uri ChecksumsUrl);
+
+    private readonly record struct ReleaseVersion(int Major, int Minor, int Patch, int? Beta) : IComparable<ReleaseVersion>
+    {
+        private static readonly Regex Pattern = new(@"^v?(\d+)\.(\d+)\.(\d+)(?:-beta(?:\.(\d+))?)?$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+        public static bool TryParse(string value, out ReleaseVersion version)
+        {
+            Match match = Pattern.Match(value);
+            if (match.Success && int.TryParse(match.Groups[1].Value, out int major) &&
+                int.TryParse(match.Groups[2].Value, out int minor) && int.TryParse(match.Groups[3].Value, out int patch))
+            {
+                int? beta = match.Groups[4].Success && int.TryParse(match.Groups[4].Value, out int betaNumber) ? betaNumber : null;
+                version = new ReleaseVersion(major, minor, patch, value.Contains("-beta", StringComparison.OrdinalIgnoreCase) ? beta ?? 0 : null);
+                return true;
+            }
+            version = default;
+            return false;
+        }
+
+        public static ReleaseVersion FromAssembly()
+        {
+            Assembly assembly = Assembly.GetExecutingAssembly();
+            string? informationalVersion = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+            if (!string.IsNullOrWhiteSpace(informationalVersion) && TryParse(informationalVersion.Split('+')[0], out var parsed))
+                return parsed;
+            Version? version = assembly.GetName().Version;
+            return new ReleaseVersion(version?.Major ?? 0, version?.Minor ?? 0, Math.Max(0, version?.Build ?? 0), null);
+        }
+
+        public int CompareTo(ReleaseVersion other)
+        {
+            int result = Major.CompareTo(other.Major);
+            if (result != 0) return result;
+            result = Minor.CompareTo(other.Minor);
+            if (result != 0) return result;
+            result = Patch.CompareTo(other.Patch);
+            if (result != 0) return result;
+            if (Beta is null) return other.Beta is null ? 0 : 1;
+            if (other.Beta is null) return -1;
+            return Beta.Value.CompareTo(other.Beta.Value);
+        }
     }
 
     private void HandleShortcuts(object? sender, KeyEventArgs e)

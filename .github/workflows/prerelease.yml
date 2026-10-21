@@ -27,7 +27,13 @@ jobs:
 
       - name: Publish self-contained app
         shell: pwsh
-        run: dotnet publish NaveBrowser.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o artifacts/publish
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+            dotnet publish NaveBrowser.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true "-p:Version=$version" "-p:InformationalVersion=$version" -o artifacts/publish
+          } else {
+            dotnet publish NaveBrowser.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o artifacts/publish
+          }
 
       - name: Package portable build
         shell: pwsh
