@@ -2331,7 +2331,8 @@ public partial class Form1 : Form
         startInfo.ArgumentList.Add(targetExe);
         startInfo.ArgumentList.Add(installDirectory);
         startInfo.ArgumentList.Add(root);
-        Process.Start(startInfo) ?? throw new InvalidOperationException("Não consegui iniciar a etapa de instalação.");
+        if (Process.Start(startInfo) is null)
+            throw new InvalidOperationException("Não consegui iniciar a etapa de instalação.");
         _isShuttingDown = true;
         Application.Exit();
     }
