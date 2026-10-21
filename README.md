@@ -4,7 +4,7 @@ Nave é um navegador experimental para Windows, feito com Windows Forms e Micros
 
 ## Estado
 
-Esta é uma versão de testes e ainda não há instalador. O Nave verifica o GitHub uma vez por dia e, quando há uma versão publicada mais nova, pede confirmação antes de baixar e instalar. O pacote e seu checksum SHA-256 são conferidos antes da substituição do executável. O GitHub Actions compila em pushes e pull requests; tags como `v0.1.1-beta.1` geram um pré-lançamento com ZIP portátil e checksum.
+Esta é uma versão de testes e ainda não há instalador. O Nave verifica o GitHub uma vez por dia e também permite buscar atualizações manualmente em **Configurações**. Ao encontrar uma versão nova, mostra as notas de versão, o progresso do download e a etapa de verificação. O pacote e seu checksum SHA-256 são conferidos antes da substituição do executável. O GitHub Actions compila em pushes e pull requests; tags como `v0.1.1-beta.1` geram um pré-lançamento com ZIP portátil e checksum.
 
 ## Requisitos
 

@@ -55,6 +55,7 @@ public partial class Form1 : Form
     private CoreWebView2Environment? _environment;
     private BrowserTab? _activeTab;
     private Button? _blockerButton;
+    private Form? _settingsDialog;
     private ToolStripMenuItem? _blockerMenuEnabled;
     private ToolStripMenuItem? _blockerMenuSiteException;
     private ToolStripMenuItem? _blockerMenuStatus;
@@ -2099,8 +2100,9 @@ public partial class Form1 : Form
             Size = new Size(320, 30),
             ForeColor = MutedColor
         };
-        var checkButton = MakeDialogButton("Procurar", 392, 29, 104);
+        var checkButton = MakeDialogButton("Verificar agora", 374, 29, 122);
         checkButton.Click += async (_, _) => await CheckForUpdatesAsync(automatic: false);
+        updateDescription.Size = new Size(344, 36);
         updateCard.Controls.AddRange([updateTitle, updateDescription, checkButton]);
 
         var extensionCard = CreateSettingsCard(22, 197, 516, 74);
@@ -2144,7 +2146,9 @@ public partial class Form1 : Form
         shortcutsCard.Controls.AddRange([shortcutsTitle, shortcuts]);
         dialog.Controls.AddRange([title, subtitle, updateCard, extensionCard, shortcutsCard]);
         dialog.AcceptButton = checkButton;
-        dialog.ShowDialog(this);
+        _settingsDialog = dialog;
+        try { dialog.ShowDialog(this); }
+        finally { _settingsDialog = null; }
     }
 
     private Panel CreateSettingsCard(int x, int y, int width, int height)
@@ -2199,7 +2203,7 @@ public partial class Form1 : Form
             }
 
             if (MessageBox.Show(this,
-                    $"Uma nova versão do Nave está disponível: {release.Tag}.\nVersão atual: {GetCurrentVersionText()}\n\nBaixar e instalar agora? O Nave vai fechar e reabrir ao terminar.",
+                    $"Uma nova versão do Nave está disponível: {release.Tag}.\nVersão atual: {GetCurrentVersionText()}\n\n{FormatReleaseNotes(release.ReleaseNotes)}\n\nBaixar e instalar agora? O Nave vai fechar e reabrir ao terminar.",
                     "Atualização disponível", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes)
                 return;
 
@@ -2245,6 +2249,7 @@ public partial class Form1 : Form
             if (!item.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array) continue;
             string? zipUrl = null;
             string? checksumsUrl = null;
+            string releaseNotes = item.TryGetProperty("body", out var bodyElement) ? bodyElement.GetString() ?? "" : "";
             foreach (JsonElement asset in assets.EnumerateArray())
             {
                 string? name = asset.TryGetProperty("name", out var nameElement) ? nameElement.GetString() : null;
@@ -2254,7 +2259,7 @@ public partial class Form1 : Form
             }
             if (!Uri.TryCreate(zipUrl, UriKind.Absolute, out var zipUri) || zipUri.Host != "github.com" ||
                 !Uri.TryCreate(checksumsUrl, UriKind.Absolute, out var checksumUri) || checksumUri.Host != "github.com") continue;
-            var release = new GitHubRelease(tag, version, zipUri, checksumUri);
+            var release = new GitHubRelease(tag, version, zipUri, checksumUri, releaseNotes);
             if (latest is null || release.Version.CompareTo(latest.Version) > 0) latest = release;
         }
         return latest;
@@ -2262,6 +2267,9 @@ public partial class Form1 : Form
 
     private async Task DownloadAndInstallUpdateAsync(GitHubRelease release)
     {
+        using var progress = new UpdateProgressForm(release.Tag);
+        progress.Show(_settingsDialog ?? this);
+        progress.Activate();
         _stateLabel.Text = $"Baixando Nave {release.Tag}…";
         string root = Path.Combine(Path.GetTempPath(), "NaveUpdate-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
@@ -2276,6 +2284,8 @@ public partial class Form1 : Form
             await using var output = new FileStream(zipPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
             var buffer = new byte[64 * 1024];
             long total = 0;
+            long expected = response.Content.Headers.ContentLength ?? -1;
+            progress.SetStage("Baixando pacote de atualização", expected > 0 ? 0 : null);
             int read;
             while ((read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length))) > 0)
             {
@@ -2283,10 +2293,14 @@ public partial class Form1 : Form
                 if (total > maxArchiveBytes)
                     throw new InvalidDataException("O arquivo de atualização excede o limite permitido.");
                 await output.WriteAsync(buffer.AsMemory(0, read));
+                if (expected > 0)
+                    progress.SetStage($"Baixando pacote · {FormatBytes(total)} de {FormatBytes(expected)}",
+                        (int)Math.Clamp(total * 100 / expected, 0, 100));
             }
             if (total == 0) throw new InvalidDataException("O arquivo de atualização está vazio.");
         }
 
+        progress.SetStage("Conferindo a integridade do pacote", null);
         string checksums = await UpdateHttpClient.GetStringAsync(release.ChecksumsUrl);
         Match checksumMatch = Regex.Match(checksums,
             "(?im)^(?<hash>[a-f0-9]{64})\\s+\\*?Nave-win-x64\\.zip\\s*$");
@@ -2297,6 +2311,7 @@ public partial class Form1 : Form
                 Convert.FromHexString(actualHash), Convert.FromHexString(checksumMatch.Groups["hash"].Value)))
             throw new InvalidDataException("A verificação SHA-256 do pacote falhou. A atualização foi cancelada.");
 
+        progress.SetStage("Preparando os arquivos", null);
         string stagedExe = Path.Combine(root, "Nave.exe");
         using (var zip = ZipFile.OpenRead(zipPath))
         {
@@ -2331,11 +2346,25 @@ public partial class Form1 : Form
         startInfo.ArgumentList.Add(targetExe);
         startInfo.ArgumentList.Add(installDirectory);
         startInfo.ArgumentList.Add(root);
+        progress.SetStage("Pacote verificado · reiniciando o Nave", null);
         if (Process.Start(startInfo) is null)
             throw new InvalidOperationException("Não consegui iniciar a etapa de instalação.");
         _isShuttingDown = true;
+        progress.Close();
         Application.Exit();
     }
+
+    private static string FormatReleaseNotes(string notes)
+    {
+        string plain = Regex.Replace(notes, @"(?m)^\s{0,3}(?:[-*+]\s+|#{1,6}\s*)", "• ").Trim();
+        plain = Regex.Replace(plain, @"[`*_>#]", "");
+        if (plain.Length > 700) plain = plain[..697].TrimEnd() + "…";
+        return string.IsNullOrWhiteSpace(plain) ? "Esta versão inclui melhorias e correções." : $"Novidades:\n{plain}";
+    }
+
+    private static string FormatBytes(long bytes) => bytes >= 1024 * 1024
+        ? $"{bytes / 1024d / 1024d:0.0} MB"
+        : $"{bytes / 1024d:0} KB";
 
     private const string UpdateInstallScript = """
         param([int]$ParentId, [string]$StagedExe, [string]$TargetExe, [string]$WorkDirectory, [string]$UpdateDirectory)
@@ -2365,7 +2394,65 @@ public partial class Form1 : Form
         }
         """;
 
-    private sealed record GitHubRelease(string Tag, ReleaseVersion Version, Uri ZipUrl, Uri ChecksumsUrl);
+    private sealed class UpdateProgressForm : Form
+    {
+        private readonly Label _status = new();
+        private readonly ProgressBar _progress = new();
+
+        public UpdateProgressForm(string version)
+        {
+            Text = "Atualizando o Nave";
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            ControlBox = false;
+            ShowInTaskbar = false;
+            ClientSize = new Size(430, 150);
+            BackColor = WindowColor;
+            ForeColor = TextColor;
+            Font = new Font("Segoe UI", 9F);
+
+            var title = new Label
+            {
+                Text = $"Atualizando para {version}",
+                Location = new Point(24, 20),
+                Size = new Size(382, 28),
+                ForeColor = TextColor,
+                Font = new Font("Segoe UI Semibold", 12F)
+            };
+            _status.Location = new Point(25, 60);
+            _status.Size = new Size(380, 22);
+            _status.ForeColor = MutedColor;
+            _status.Text = "Preparando atualização…";
+            _progress.Location = new Point(24, 98);
+            _progress.Size = new Size(382, 14);
+            _progress.Style = ProgressBarStyle.Marquee;
+            _progress.MarqueeAnimationSpeed = 24;
+            Controls.AddRange([title, _status, _progress]);
+        }
+
+        public void SetStage(string status, int? percent)
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired)
+            {
+                BeginInvoke((Action)(() => SetStage(status, percent)));
+                return;
+            }
+
+            _status.Text = status;
+            if (percent.HasValue)
+            {
+                _progress.Style = ProgressBarStyle.Continuous;
+                _progress.Value = Math.Clamp(percent.Value, 0, 100);
+            }
+            else
+            {
+                _progress.Style = ProgressBarStyle.Marquee;
+            }
+        }
+    }
+
+    private sealed record GitHubRelease(string Tag, ReleaseVersion Version, Uri ZipUrl, Uri ChecksumsUrl, string ReleaseNotes);
 
     private readonly record struct ReleaseVersion(int Major, int Minor, int Patch, int? Beta) : IComparable<ReleaseVersion>
     {
